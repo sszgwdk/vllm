@@ -164,3 +164,8 @@ class SchedulerOutput:
 
     # KV Cache Connector metadata.
     kv_connector_metadata: Optional[KVConnectorMetadata] = None
+
+    # Gate Mechanism
+    # gate_scores: Optional[dict[str, float]] = None
+    probe_map: Optional[dict[str, str]] = None
+    gate_params: Optional[tuple[int, int]] = None

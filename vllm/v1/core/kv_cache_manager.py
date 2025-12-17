@@ -11,6 +11,7 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
+from vllm.utils import cdiv
 
 logger = init_logger(__name__)
 
@@ -182,7 +183,8 @@ class KVCacheManager:
             self.coordinator.find_longest_cache_hit(request.block_hashes,
                                                     max_cache_hit_length))
 
-        if self.log_stats:
+        # 对于 probe_req 的命中，不计入统计
+        if self.log_stats and not request.is_probe:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.requests += 1
             self.prefix_cache_stats.queries += request.num_tokens
@@ -199,6 +201,8 @@ class KVCacheManager:
         num_lookahead_tokens: int = 0,
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
+        num_external_tokens: int = 0,
+        no_set_hot: bool = False,
     ) -> Optional[KVCacheBlocks]:
         """Add slots for a request with new tokens to append.
 
@@ -274,7 +278,12 @@ class KVCacheManager:
 
         # Touch the computed blocks to make sure they won't be evicted.
         if self.enable_caching:
-            self.block_pool.touch(new_computed_block_list)
+            # 对于 probe_req 的命中，不设置 is_hot
+            if self.kv_cache_config.enable_gate_optimization and no_set_hot:
+                self.block_pool.touch(new_computed_block_list, no_set_hot=True)
+
+            else:
+                self.block_pool.touch(new_computed_block_list)
         else:
             assert not any(new_computed_block_list), (
                 "Computed blocks should be empty when "
@@ -287,6 +296,17 @@ class KVCacheManager:
 
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id, num_tokens_need_slot, num_encoder_tokens)
+
+        # num_tokens_need_slot = num_computed_tokens + external_tokens + num_new_tokens
+        # 此时 new_blocks 包含了 external tokens 和 new_tokens 对应的 blocks
+        # 需要计算出 external tokens 对应的 blocks 数量，将其标记为 is_hot = True
+        if self.kv_cache_config.enable_gate_optimization and \
+            self.block_size is not None and self.block_size > 0 and num_external_tokens > 0:
+            # 理论上 num_external_tokens 一定是 block_size 的整数倍
+            num_external_blocks = cdiv(num_external_tokens, self.block_size)
+            for group in new_blocks:
+                for block in group[:num_external_blocks]:
+                    block.is_hot = True
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.

@@ -319,7 +319,7 @@ class BlockPool:
                              medium=MEDIUM_GPU))
         return True
 
-    def touch(self, blocks: tuple[list[KVCacheBlock], ...]) -> None:
+    def touch(self, blocks: tuple[list[KVCacheBlock], ...], no_set_hot: bool = False) -> None:
         """Touch a block increases its reference count by 1, and may remove
         the block from the free queue. This is used when a block is hit by
         another request with the same prefix.
@@ -414,3 +414,72 @@ class BlockPool:
         events = self.kv_event_queue
         self.kv_event_queue = []
         return events
+
+class ColdHotBlockPool(BlockPool):
+    """对 block 的 is_hot 属性进行管理的 BlockPool。
+    """
+
+    def __init__(
+        self,
+        num_gpu_blocks: int,
+        enable_caching: bool,
+        enable_kv_cache_events: bool = False,
+    ):
+        super().__init__(num_gpu_blocks, enable_caching, enable_kv_cache_events)
+    
+    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+        """ new blocks is_hot 属性初始化为 False。
+        """
+        if num_blocks > self.get_num_free_blocks():
+            raise ValueError(
+                f"Cannot get {num_blocks} free blocks from the pool")
+
+        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+
+        # In order to only iterate the list once, we duplicated code a bit
+        if self.enable_caching:
+            for block in ret:
+                self._maybe_evict_cached_block(block)
+                assert block.ref_cnt == 0
+                block.ref_cnt += 1
+                block.is_hot = False
+        else:
+            for block in ret:
+                assert block.ref_cnt == 0
+                block.ref_cnt += 1
+                block.is_hot = False
+        return ret
+
+    def touch(self, blocks: tuple[list[KVCacheBlock], ...], no_set_hot: bool = False) -> None:
+        """touch 发生在 block 被命中时，设置 is_hot 为 True。
+        """
+        for blocks_per_group in blocks:
+            for block in blocks_per_group:
+                # ref_cnt=0 means this block is in the free list (i.e. eviction
+                # candidate), so remove it.
+                if block.ref_cnt == 0 and not block.is_null:
+                    self.free_block_queue.remove(block)
+                block.ref_cnt += 1
+                
+                # 对于 probe_req 的命中，不设置 is_hot
+                if not no_set_hot:
+                    block.is_hot = True
+
+    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+        """hot blocks 放到 free queue 的后面, cold blocks 放到前面。
+        这样可以优先分配 cold blocks, 减少 hot blocks 被 evict 的概率
+        """
+        # Materialize the iterable to allow multiple passes.
+        blocks_list = list(ordered_blocks)
+        hot_blocks = []
+        cold_blocks = []
+        for block in blocks_list:
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0 and not block.is_null:
+                if block.is_hot:
+                    hot_blocks.append(block)
+                else:
+                    cold_blocks.append(block)
+        
+        self.free_block_queue.append_n(hot_blocks)
+        self.free_block_queue.prepend_n(cold_blocks)

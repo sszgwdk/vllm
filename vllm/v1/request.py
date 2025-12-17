@@ -98,6 +98,11 @@ class Request:
         # Multi-modal related
         self.mm_features = mm_features or []
         self.num_encoder_inputs = len(self.mm_features)
+
+        # Gate Mechanism
+        self.probe_req_id: Optional[str] = None
+        self.is_probe: bool = False
+
         self.has_encoder_inputs = self.num_encoder_inputs > 0
 
         # Read-only views

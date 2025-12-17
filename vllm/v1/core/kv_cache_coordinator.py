@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.block_pool import BlockPool, ColdHotBlockPool
 from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager, FullAttentionManager, get_manager_for_kv_cache_spec)
@@ -30,7 +30,11 @@ class KVCacheCoordinator(ABC):
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
 
-        self.block_pool = BlockPool(kv_cache_config.num_blocks, enable_caching,
+        if kv_cache_config.enable_gate_optimization:
+            self.block_pool = ColdHotBlockPool(kv_cache_config.num_blocks, enable_caching,
+                                    enable_kv_cache_events)
+        else:
+            self.block_pool = BlockPool(kv_cache_config.num_blocks, enable_caching,
                                     enable_kv_cache_events)
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled

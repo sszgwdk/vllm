@@ -48,13 +48,55 @@ except ImportError:
 PROMPT = "You are a helpful assistant in recognizes the content of tables in markdown format. Here is a table as fellows. You need to answer my question about the table.\n# Table\n|Opening|Opening|Sl. No.|Film|Cast|Director|Music Director|Notes|\n|----|----|----|----|----|----|----|----|\n|J A N|9|1|Agni Pushpam|Jayabharathi, Kamalahasan|Jeassy|M. K. Arjunan||\n|J A N|16|2|Priyamvada|Mohan Sharma, Lakshmi, KPAC Lalitha|K. S. Sethumadhavan|V. Dakshinamoorthy||\n|J A N|23|3|Yakshagaanam|Madhu, Sheela|Sheela|M. S. Viswanathan||\n|J A N|30|4|Paalkkadal|Sheela, Sharada|T. K. Prasad|A. T. Ummer||\n|F E B|5|5|Amma|Madhu, Srividya|M. Krishnan Nair|M. K. Arjunan||\n|F E B|13|6|Appooppan|Thikkurissi Sukumaran Nair, Kamal Haasan|P. Bhaskaran|M. S. Baburaj||\n|F E B|20|7|Srishti|Chowalloor Krishnankutty, Ravi Alummoodu|K. T. Muhammad|M. S. Baburaj||\n|F E B|20|8|Vanadevatha|Prem Nazir, Madhubala|Yusufali Kechery|G. Devarajan||\n|F E B|27|9|Samasya|Madhu, Kamalahaasan|K. Thankappan|Shyam||\n|F E B|27|10|Yudhabhoomi|K. P. Ummer, Vidhubala|Crossbelt Mani|R. K. Shekhar||\n|M A R|5|11|Seemantha Puthran|Prem Nazir, Jayabharathi|A. B. Raj|M. K. Arjunan||\n|M A R|12|12|Swapnadanam|Rani Chandra, Dr. Mohandas|K. G. George|Bhaskar Chandavarkar||\n|M A R|19|13|Thulavarsham|Prem Nazir, sreedevi, Sudheer|N. Sankaran Nair|V. Dakshinamoorthy||\n|M A R|20|14|Aruthu|Kaviyoor Ponnamma, Kamalahasan|Ravi|G. Devarajan||\n|M A R|26|15|Swimming Pool|Kamal Haasan, M. G. Soman|J. Sasikumar|M. K. Arjunan||\n\n# Question\nWhat' s the content in the (1,1) cells\n"  # noqa: E501
 
 
+def get_detailed_metrics(llm):
+    metrics = {}
+    try:
+        from vllm.v1.metrics.loggers import LoggingStatLogger
+        if hasattr(llm.llm_engine, 'logger_manager'):
+            logger_manager = llm.llm_engine.logger_manager
+            if logger_manager is None:
+                return None
+            
+            for engine_loggers in logger_manager.per_engine_logger_dict.values():
+                for logger in engine_loggers:
+                    if isinstance(logger, LoggingStatLogger):
+                        metrics['prefix_cache_hit_rate'] = logger.prefix_caching_metrics.hit_rate
+                        if hasattr(logger.prefix_caching_metrics, 'total_hit_rate'):
+                            metrics['prefix_cache_total_hit_rate'] = logger.prefix_caching_metrics.total_hit_rate
+                        
+                        if hasattr(logger, 'cumulative_prompt_tokens'):
+                            metrics['total_prompt_tokens'] = logger.cumulative_prompt_tokens
+                        if hasattr(logger, 'cumulative_generation_tokens'):
+                            metrics['total_generation_tokens'] = logger.cumulative_generation_tokens
+                        
+                        return metrics
+    except Exception:
+        pass
+    return None
+
+
 def test_prefix(llm=None, sampling_params=None, prompts=None):
     start_time = time.time()
 
     llm.generate(prompts, sampling_params=sampling_params)
 
     end_time = time.time()
-    print(f"cost time {end_time - start_time}")
+    duration = end_time - start_time
+    print(f"cost time {duration:.2f}s")
+    
+    metrics = get_detailed_metrics(llm)
+    if metrics:
+        if 'prefix_cache_hit_rate' in metrics:
+            print(f"Prefix cache hit rate (recent): {metrics['prefix_cache_hit_rate'] * 100:.2f}%")
+        if 'prefix_cache_total_hit_rate' in metrics:
+            print(f"Prefix cache hit rate (total): {metrics['prefix_cache_total_hit_rate'] * 100:.2f}%")
+        
+        if 'total_prompt_tokens' in metrics and 'total_generation_tokens' in metrics:
+            total_tokens = metrics['total_prompt_tokens'] + metrics['total_generation_tokens']
+            print(f"Total prompt tokens: {metrics['total_prompt_tokens']}")
+            print(f"Total generation tokens: {metrics['total_generation_tokens']}")
+            print(f"Total tokens: {total_tokens}")
+            print(f"Average throughput: {total_tokens / duration:.2f} tokens/s")
 
 
 @dataclasses.dataclass
@@ -82,8 +124,8 @@ def sample_requests_from_dataset(
     input_length_range: tuple[int, int],
     fixed_output_len: Optional[int],
 ) -> list[Request]:
-    if fixed_output_len is not None and fixed_output_len < 4:
-        raise ValueError("output_len too small")
+    # if fixed_output_len is not None and fixed_output_len < 4:
+    #     raise ValueError("output_len too small")
 
     # Load the dataset.
     with open(dataset_path) as f:
@@ -196,7 +238,7 @@ def main(args):
     print(f"Max Prompt Length: {max(prompt_lens)}")
 
     engine_args = EngineArgs.from_cli_args(args)
-
+    engine_args.disable_log_stats = False
     llm = LLM(**dataclasses.asdict(engine_args))
 
     sampling_params = SamplingParams(

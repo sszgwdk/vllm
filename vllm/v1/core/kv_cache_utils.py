@@ -112,6 +112,10 @@ class PrefixCachingMetrics:
         # A deque of (requests, queries, hits) for the most recent requests.
         self.query_queue: deque[tuple[int, int, int]] = deque()
 
+        # Cumulative stats
+        self.total_queries = 0
+        self.total_hits = 0
+
     def observe(self, stats: PrefixCacheStats):
         """Observe the prefix caching for a set of requests.
 
@@ -139,6 +143,10 @@ class PrefixCachingMetrics:
         self.aggregated_requests += stats.requests
         self.aggregated_query_total += stats.queries
         self.aggregated_query_hit += stats.hits
+        
+        # Update cumulative stats
+        self.total_queries += stats.queries
+        self.total_hits += stats.hits
 
         # Remove the oldest stats until number of requests does not exceed
         # the limit.
@@ -158,12 +166,22 @@ class PrefixCachingMetrics:
         self.aggregated_query_hit = 0
         self.query_queue.clear()
 
+        self.total_queries = 0
+        self.total_hits = 0
+
     @property
     def hit_rate(self) -> float:
         """Calculate the hit rate for the past N requests."""
         if self.aggregated_query_total == 0:
             return 0.0
         return self.aggregated_query_hit / self.aggregated_query_total
+        
+    @property
+    def total_hit_rate(self) -> float:
+        """Calculate the hit rate for all requests since last reset."""
+        if self.total_queries == 0:
+            return 0.0
+        return self.total_hits / self.total_queries
 
 
 @dataclass
@@ -184,6 +202,9 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+
+    # HBM Eviction Policy Optimization
+    is_hot: bool = False
 
     @property
     def block_hash(self) -> Optional[BlockHashWithGroupId]:
@@ -382,6 +403,9 @@ class FreeKVCacheBlockQueue:
         if len(blocks) == 0:
             return
 
+        # 示意：
+        # fake_free_list_tail <-> block1 <-> block2 <-> ... <-> blockN <-> last_block
+
         last_block = self.fake_free_list_tail.prev_free_block
         assert last_block is not None, (
             "prev_free_block of fake_free_list_tail should always exist")
@@ -394,6 +418,34 @@ class FreeKVCacheBlockQueue:
         # Connect the last block of <blocks> to the fake tail
         last_block.next_free_block = self.fake_free_list_tail
         self.fake_free_list_tail.prev_free_block = last_block
+
+        self.num_free_blocks += len(blocks)
+
+    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Prepend a list of blocks to the head of the free list.
+
+        Args:
+            blocks: A list of blocks to prepend.
+        """
+        if len(blocks) == 0:
+            return
+
+        # 示意：
+        # fake_free_list_head <-> block1 <-> block2 <-> ... <-> blockN <-> first_block
+        # 注意上层会对 blocks 进行 reverse，此时 block1 是 prompt 尾部的 block，优先被淘汰
+
+        first_block = self.fake_free_list_head.next_free_block
+        assert first_block is not None, (
+            "next_free_block of fake_free_list_head should always exist")
+        
+        prev_block = self.fake_free_list_head
+        for block in blocks:
+            prev_block.next_free_block = block
+            block.prev_free_block = prev_block
+            prev_block = block
+
+        prev_block.next_free_block = first_block
+        first_block.prev_free_block = prev_block
 
         self.num_free_blocks += len(blocks)
 

@@ -84,6 +84,16 @@ class SchedulerConfig:
     is_multimodal_model: bool = False
     """True if the model is multimodal."""
 
+    # gate mechanism configs
+    enable_gate_optimization: bool = False
+    """If True, enables the Gate Mechanism optimization using probe requests."""
+
+    debug_gate_mechanism: bool = False
+    """If True, enables additional logging for the Gate Mechanism optimization."""
+
+    gate_probe_ids: Any = None
+    """Dictionary containing token IDs for the gate mechanism probe."""
+
     # TODO (ywang96): Make this configurable.
     max_num_encoder_input_tokens: int = field(init=False)
     """Multimodal encoder compute budget, only used in V1.

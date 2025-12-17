@@ -7,8 +7,10 @@ import itertools
 import time
 from collections import defaultdict
 from collections.abc import Iterable
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, Callable
+import math
 
+from vllm.sampling_params import SamplingParams
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.factory import (
@@ -28,6 +30,7 @@ from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
 from vllm.v1.core.sched.request_queue import (SchedulingPolicy,
                                               create_request_queue)
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
                             EngineCoreOutputs)
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -164,9 +167,29 @@ class Scheduler(SchedulerInterface):
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
 
+        # Gate Mechanism
+        self.probe_suffix_ids = []
+        self.yes_id = 0
+        self.no_id = 0
+        if self.scheduler_config.enable_gate_optimization:
+            if self.scheduler_config.gate_probe_ids:
+                self.probe_suffix_ids = self.scheduler_config.gate_probe_ids["probe_suffix_ids"]
+                self.yes_id = self.scheduler_config.gate_probe_ids["yes_id"]
+                self.no_id = self.scheduler_config.gate_probe_ids["no_id"]
+                
+                # notice: enable gate optimization in kv_cache_config
+                self.kv_cache_config.enable_gate_optimization = True
+                self.kv_cache_config.debug_gate_mechanism = \
+                    self.scheduler_config.debug_gate_mechanism
+            else:
+                logger.warning("Gate optimization enabled but no probe IDs provided.")
+
+        self.probe_map = {} # probe_id -> raw_id
+        self.request_block_hasher: Optional[Callable[[Request],list[BlockHash]]] = None
+
         # Create the KV cache manager.
         self.kv_cache_manager = KVCacheManager(
-            kv_cache_config=kv_cache_config,
+            kv_cache_config=self.kv_cache_config,
             max_model_len=self.max_model_len,
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=self.use_eagle,
@@ -471,11 +494,12 @@ class Scheduler(SchedulerInterface):
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens + num_external_computed_tokens,
-                    num_new_local_computed_tokens,
-                    new_computed_blocks,
+                    num_new_local_computed_tokens,                          # HBM 中已缓存的 token 数
+                    new_computed_blocks,                                    # HBM 中已缓存的 KV blocks
                     num_lookahead_tokens=effective_lookahead_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
+                    num_external_tokens=num_external_computed_tokens,
                 )
 
                 if new_blocks is None:
@@ -510,6 +534,69 @@ class Scheduler(SchedulerInterface):
                                          scheduled_timestamp)
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
+
+                    # Gate Mechanism
+                    # 为该 request 创建对应的 probe_req, probe_req 指导 llm 预测 yes/no 以计算 gate score
+                    # 指导后续 lmcache 的卸载策略
+                    if (self.scheduler_config.enable_gate_optimization and 
+                        not request.is_probe and 
+                        request.request_id not in self.probe_map.values() and
+                        request.probe_req_id is None):
+                        
+                        probe_req_id = f"probe_{request.request_id}"
+                        probe_prompt_ids = request.prompt_token_ids + self.probe_suffix_ids
+                        probe_sampling_params = SamplingParams(max_tokens=1)
+                        
+                        probe_req = Request(
+                            request_id=probe_req_id,
+                            client_index=request.client_index,
+                            prompt_token_ids=probe_prompt_ids,
+                            prompt_embeds=None,
+                            mm_features=None,
+                            sampling_params=probe_sampling_params,
+                            pooling_params=None,
+                            eos_token_id=request.eos_token_id,
+                            arrival_time=request.arrival_time,
+                            lora_request=request.lora_request,
+                            structured_output_request=None,
+                            cache_salt=request.cache_salt,
+                            priority=request.priority,
+                            trace_headers=request.trace_headers,
+                            block_hasher=self.request_block_hasher,
+                        )
+                        probe_req.is_probe = True
+                        
+                        # 此时会匹配到 raw_req 已分配的所有 blocks (除了末尾 not full 的 block)
+                        probe_computed_blocks, probe_num_computed = self.kv_cache_manager.get_computed_blocks(probe_req)
+                        probe_num_new = probe_req.num_tokens - probe_num_computed
+
+                        # 如果预算不足，则不安排 probe 请求(该 req 不使用优化)
+                        # TODO(wk): vLLM 使用 cascade attention, 对于共享前缀的计算不会重复计算, 此处或许不需要占用 token 预算 ?
+                        if probe_num_new + num_new_tokens <= token_budget:
+                             probe_new_blocks = self.kv_cache_manager.allocate_slots(
+                                probe_req,
+                                probe_num_new,
+                                probe_num_computed,
+                                probe_computed_blocks,
+                                no_set_hot=True,  # probe_req 命中时不设置 is_hot
+                             )
+                             
+                             if probe_new_blocks is not None:
+                                 self.probe_map[probe_req_id] = request.request_id
+                                 request.probe_req_id = probe_req_id
+                                 
+                                 scheduled_new_reqs.append(probe_req)
+                                 self.running.append(probe_req)
+                                 self.requests[probe_req_id] = probe_req
+                                 
+                                 req_to_new_blocks[probe_req_id] = probe_new_blocks
+                                 num_scheduled_tokens[probe_req_id] = probe_num_new
+                                 token_budget -= probe_num_new
+                                 probe_req.status = RequestStatus.RUNNING
+                                 probe_req.num_computed_tokens = probe_num_computed + probe_num_new
+                                 if probe_req.num_cached_tokens < 0:
+                                     probe_req.num_cached_tokens = probe_num_computed
+
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
                 else:
@@ -596,6 +683,8 @@ class Scheduler(SchedulerInterface):
             get_freed_mm_hashes(),
             structured_output_request_ids=structured_output_request_ids,
             grammar_bitmask=grammar_bitmask,
+            probe_map=self.probe_map,
+            gate_params=(self.yes_id, self.no_id) if self.scheduler_config.enable_gate_optimization else None,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -881,6 +970,7 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        probe_reqs_to_abort: list[str] = []
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -888,6 +978,14 @@ class Scheduler(SchedulerInterface):
                 # The request is already finished. This can happen if the
                 # request is aborted while the model is executing it (e.g.,
                 # in pipeline parallelism).
+                continue
+
+            # Gate Mechanism: Process probe results
+            # 直接 abort 并且不返回任何结果
+            if request.is_probe:
+                del self.probe_map[req_id]
+                # self.finish_requests([req_id], RequestStatus.FINISHED_ABORTED)
+                probe_reqs_to_abort.append(req_id)
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
@@ -977,6 +1075,11 @@ class Scheduler(SchedulerInterface):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+
+        # Abort probe requests after processing all other requests
+        if self.scheduler_config.enable_gate_optimization and len(probe_reqs_to_abort) > 0:
+            self.finish_requests(probe_reqs_to_abort,
+                                 RequestStatus.FINISHED_ABORTED)
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
@@ -1294,3 +1397,6 @@ class Scheduler(SchedulerInterface):
                     "but the request is already freed.", req_id)
             else:
                 self._free_blocks(self.requests[req_id])
+    
+    def set_block_hasher(self, block_hasher : Callable[[Request],list[BlockHash]]) -> None:
+        self.request_block_hasher = block_hasher

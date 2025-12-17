@@ -65,6 +65,10 @@ class LoggingStatLogger(StatLoggerBase):
         self.kv_transfer_logging = KVConnectorLogging(kv_tranfer_config)
         self.last_prompt_throughput: float = 0.0
         self.last_generation_throughput: float = 0.0
+        
+        # Cumulative stats
+        self.cumulative_prompt_tokens = 0
+        self.cumulative_generation_tokens = 0
 
     def _reset(self, now):
         self.last_log_time = now
@@ -77,6 +81,10 @@ class LoggingStatLogger(StatLoggerBase):
         # Save tracked stats for token counters.
         self.num_prompt_tokens += iteration_stats.num_prompt_tokens
         self.num_generation_tokens += iteration_stats.num_generation_tokens
+        
+        # Cumulative
+        self.cumulative_prompt_tokens += iteration_stats.num_prompt_tokens
+        self.cumulative_generation_tokens += iteration_stats.num_generation_tokens
 
     def _get_throughput(self, tracked_stats: int, now: float) -> float:
         # Compute summary metrics for tracked stats

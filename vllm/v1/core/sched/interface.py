@@ -156,3 +156,7 @@ class SchedulerInterface(ABC):
 
     def get_kv_connector(self) -> Optional["KVConnectorBase_V1"]:
         return None
+
+    @abstractmethod
+    def set_block_hasher(self, block_hasher) -> None:
+        raise NotImplementedError

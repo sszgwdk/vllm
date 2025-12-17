@@ -94,6 +94,11 @@ class KVConnectorBase_V1(ABC):
     def role(self) -> KVConnectorRole:
         return self._role
 
+    @property
+    def metadata(self) -> KVConnectorMetadata:
+        assert self._connector_metadata is not None
+        return self._connector_metadata
+
     # ==============================
     # Worker-side methods
     # ==============================

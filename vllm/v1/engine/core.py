@@ -163,6 +163,8 @@ class EngineCore:
             self.request_block_hasher = get_request_block_hasher(
                 block_size, caching_hash_fn)
 
+            self.scheduler.set_block_hasher(self.request_block_hasher)
+
         self.step_fn = (self.step if self.batch_queue is None else
                         self.step_with_batch_queue)
 

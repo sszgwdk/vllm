@@ -373,3 +373,6 @@ class KVCacheConfig:
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
     kv_cache_groups: list[KVCacheGroupSpec]
+
+    enable_gate_optimization: bool = False
+    debug_gate_mechanism: bool = False

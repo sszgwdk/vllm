@@ -85,10 +85,11 @@ class KVConnectorModelRunnerMixin:
 
     @staticmethod
     def maybe_get_kv_connector_output(
-        scheduler_output: "SchedulerOutput"
+        scheduler_output: "SchedulerOutput",
+        skip_postprocess: bool = False,
     ) -> AbstractContextManager[Optional[KVConnectorOutput]]:
         return KVConnectorModelRunnerMixin._get_kv_connector_output(
-            scheduler_output) if has_kv_transfer_group() else nullcontext()
+            scheduler_output, skip_postprocess=skip_postprocess) if has_kv_transfer_group() else nullcontext()
 
     # This context manager must be used within an active forward context.
     # It encapsulates the entire KV connector lifecycle within execute_model
@@ -96,7 +97,8 @@ class KVConnectorModelRunnerMixin:
     @contextmanager
     def _get_kv_connector_output(
         scheduler_output: "SchedulerOutput",
-        wait_for_save: bool = True
+        wait_for_save: bool = True,
+        skip_postprocess: bool = False,
     ) -> Generator[KVConnectorOutput, None, None]:
         output = KVConnectorOutput()
 
@@ -115,6 +117,9 @@ class KVConnectorModelRunnerMixin:
         try:
             yield output
         finally:
+            if skip_postprocess:
+                return
+
             if wait_for_save:
                 kv_connector.wait_for_save()
 

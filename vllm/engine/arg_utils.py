@@ -418,6 +418,8 @@ class EngineArgs:
     enable_chunked_prefill: Optional[
         bool] = SchedulerConfig.enable_chunked_prefill
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
+    enable_gate_optimization: bool = SchedulerConfig.enable_gate_optimization
+    debug_gate_mechanism: bool = SchedulerConfig.debug_gate_mechanism
 
     disable_hybrid_kv_cache_manager: bool = (
         SchedulerConfig.disable_hybrid_kv_cache_manager)
@@ -915,6 +917,11 @@ class EngineArgs:
         scheduler_group.add_argument("--async-scheduling",
                                      **scheduler_kwargs["async_scheduling"])
 
+        scheduler_group.add_argument("--enable-gate-optimization",
+                                     **scheduler_kwargs["enable_gate_optimization"])
+        scheduler_group.add_argument("--debug-gate-mechanism",
+                                     **scheduler_kwargs["debug_gate_mechanism"])
+
         # vLLM arguments
         vllm_kwargs = get_kwargs(VllmConfig)
         vllm_group = parser.add_argument_group(
@@ -1377,6 +1384,8 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.
             disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
+            enable_gate_optimization=self.enable_gate_optimization,
+            debug_gate_mechanism=self.debug_gate_mechanism,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

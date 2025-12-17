@@ -3,6 +3,7 @@
 
 import gc
 import itertools
+import math
 import time
 from collections import defaultdict
 from collections.abc import Iterator
@@ -2282,6 +2283,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if ubatch_slices is not None:
             num_input_tokens = ubatch_slices[0].num_tokens
 
+        # gate mechanism: 由于需要先计算出 gate score 才能决定 lmcache 卸载(save)的策略
+        # 所以在 gate 机制下，forward 完成后不立即执行 wait_for_save 等操作
+        skip_kv_connector_postprocess_for_gate = False
+        if scheduler_output.gate_params is not None:
+            skip_kv_connector_postprocess_for_gate = True
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (set_forward_context(
@@ -2293,7 +2300,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 batch_descriptor=batch_descriptor,
                 ubatch_slices=ubatch_slices,
         ), record_function_or_nullcontext("Forward"),
-              self.maybe_get_kv_connector_output(scheduler_output) as
+              self.maybe_get_kv_connector_output(scheduler_output, skip_kv_connector_postprocess_for_gate) as
               kv_connector_output):
             model_output = self.model(
                 input_ids=input_ids,
@@ -2357,6 +2364,95 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                         src=len(get_pp_group().ranks) - 1)
                 assert model_output_broadcast_data is not None
                 logits = model_output_broadcast_data["logits"]
+
+            # for Debug: 仅计算 gate score, not do kv connector post-process
+            if scheduler_output.probe_map and scheduler_output.gate_params and self.scheduler_config.debug_gate_mechanism:
+                yes_id, no_id = scheduler_output.gate_params
+                logger.info(f"Gate Mechanism: yes_id={yes_id}, no_id={no_id}")
+                logger.info(f"logits: shape={logits.shape}")
+                logit_offset = 0
+                for i, req_id in enumerate(self.input_batch.req_ids):
+                    num_draft = 0
+                    if scheduler_output.scheduled_spec_decode_tokens:
+                        num_draft = len(
+                            scheduler_output.scheduled_spec_decode_tokens.get(
+                                req_id, []))
+                    num_sampled = num_draft + 1
+
+                    if req_id in scheduler_output.probe_map:  # prob_map: prob_req_id -> raw_req_id
+                        idx = logit_offset + num_sampled - 1
+                        if idx < logits.shape[0]:
+                            req_logits = logits[idx]
+                            yes_score = req_logits[yes_id].item()
+                            no_score = req_logits[no_id].item()
+
+                            diff = yes_score - no_score
+                            try:
+                                score = 1 / (1 + math.exp(-diff))
+                            except OverflowError:
+                                score = 0.0 if diff < 0 else 1.0
+
+                            raw_req_id = scheduler_output.probe_map[req_id]
+                            # Here we just print the gate score for debugging.
+                            logger.info(
+                                f"Gate score for req_id {raw_req_id}: {score}, yes_score: {yes_score}, no_score: {no_score}"
+                            )
+
+                    logit_offset += num_sampled
+
+
+
+            # Gate Mechanism: 计算出 gate score 并更新到 kv connector metadata 中
+            if scheduler_output.probe_map and scheduler_output.gate_params and has_kv_transfer_group():
+                yes_id, no_id = scheduler_output.gate_params
+                kv_connector = get_kv_transfer_group()
+                
+                logit_offset = 0
+                for i, req_id in enumerate(self.input_batch.req_ids):
+                    num_draft = 0
+                    if scheduler_output.scheduled_spec_decode_tokens:
+                        num_draft = len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, []))
+                    num_sampled = num_draft + 1
+                    
+                    # TODO(wk): 这段计算的 overhead 会不会比较大？
+                    if req_id in scheduler_output.probe_map:        # prob_map: prob_req_id -> raw_req_id
+                        idx = logit_offset + num_sampled - 1
+                        if idx < logits.shape[0]:
+                            req_logits = logits[idx]
+                            yes_score = req_logits[yes_id].item()
+                            no_score = req_logits[no_id].item()
+                            
+                            diff = yes_score - no_score
+                            try:
+                                score = 1 / (1 + math.exp(-diff))
+                            except OverflowError:
+                                score = 0.0 if diff < 0 else 1.0
+
+                            # 根据 score 判断是否 compress
+                            # TODO(wk): 动态阈值策略
+                            compress = True
+                            if score > 0.5:
+                                compress = False
+
+
+                            raw_req_id = scheduler_output.probe_map[req_id]
+                            if kv_connector.metadata:
+                                for req in kv_connector.metadata.requests:
+                                    if req.req_id == raw_req_id:
+                                        if req.save_spec:
+                                            # compress 会直接更新到 lmcache worker-side 的 metadata 中
+                                            req.save_spec.compress = compress
+                                            break
+                    
+                    logit_offset += num_sampled
+
+                # Post-process kv connector output.
+                kv_connector = get_kv_transfer_group()
+                kv_connector.wait_for_save()
+                kv_connector_output.finished_sending, kv_connector_output.finished_recving = (
+                    kv_connector.get_finished(scheduler_output.finished_req_ids))
+                kv_connector_output.kv_connector_stats = kv_connector.get_kv_connector_stats()
+                kv_connector.clear_connector_metadata()
 
             # Apply structured output bitmasks if present
             if scheduler_output.grammar_bitmask is not None:
