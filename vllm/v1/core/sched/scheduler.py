@@ -539,6 +539,7 @@ class Scheduler(SchedulerInterface):
                     # 为该 request 创建对应的 probe_req, probe_req 指导 llm 预测 yes/no 以计算 gate score
                     # 指导后续 lmcache 的卸载策略
                     if (self.scheduler_config.enable_gate_optimization and 
+                        num_computed_tokens < self.scheduler_config.prefix_threshold_for_use_probe_req and
                         not request.is_probe and 
                         request.request_id not in self.probe_map.values() and
                         request.probe_req_id is None):
@@ -981,7 +982,7 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Gate Mechanism: Process probe results
-            # 直接 abort 并且不返回任何结果
+            # prebe_req 只需要推理一个 token, 直接 abort 并且不返回任何结果
             if request.is_probe:
                 del self.probe_map[req_id]
                 # self.finish_requests([req_id], RequestStatus.FINISHED_ABORTED)

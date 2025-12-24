@@ -416,7 +416,9 @@ class BlockPool:
         return events
 
 class ColdHotBlockPool(BlockPool):
-    """对 block 的 is_hot 属性进行管理的 BlockPool。
+    """
+    Manages blocks with 'is_hot' attribute.
+    Maintains separate free queues for cold and hot blocks (LRU).
     """
 
     def __init__(
@@ -426,53 +428,69 @@ class ColdHotBlockPool(BlockPool):
         enable_kv_cache_events: bool = False,
     ):
         super().__init__(num_gpu_blocks, enable_caching, enable_kv_cache_events)
-    
+        # Use the existing free_block_queue as the cold queue
+        self.cold_free_queue = self.free_block_queue
+        # Create a new empty queue for hot blocks
+        self.hot_free_queue = FreeKVCacheBlockQueue([])
+
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
-        """ new blocks is_hot 属性初始化为 False。
         """
-        if num_blocks > self.get_num_free_blocks():
-            raise ValueError(
-                f"Cannot get {num_blocks} free blocks from the pool")
-
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
-
-        # In order to only iterate the list once, we duplicated code a bit
-        if self.enable_caching:
-            for block in ret:
-                self._maybe_evict_cached_block(block)
-                assert block.ref_cnt == 0
-                block.ref_cnt += 1
-                block.is_hot = False
+        Allocate new blocks, prioritizing cold blocks.
+        Newly allocated blocks are marked as cold (is_hot=False).
+        """
+        num_cold = self.cold_free_queue.num_free_blocks
+        
+        if num_cold >= num_blocks:
+            ret = self.cold_free_queue.popleft_n(num_blocks)
         else:
-            for block in ret:
-                assert block.ref_cnt == 0
-                block.ref_cnt += 1
-                block.is_hot = False
+            # Not enough cold blocks, take all cold blocks and some hot blocks
+            ret = self.cold_free_queue.popleft_n(num_cold)
+            needed = num_blocks - num_cold
+            if needed > self.hot_free_queue.num_free_blocks:
+                raise ValueError(
+                    f"Cannot get {num_blocks} free blocks from the pool")
+            ret.extend(self.hot_free_queue.popleft_n(needed))
+
+        # Initialize the blocks
+        for block in ret:
+            if self.enable_caching:
+                self._maybe_evict_cached_block(block)
+            assert block.ref_cnt == 0
+            block.ref_cnt += 1
+            block.is_hot = False
+            
         return ret
 
     def touch(self, blocks: tuple[list[KVCacheBlock], ...], no_set_hot: bool = False) -> None:
-        """touch 发生在 block 被命中时，设置 is_hot 为 True。
+        """
+        Touch blocks when they are hit.
+        Removes from free queue if necessary and sets is_hot=True.
         """
         for blocks_per_group in blocks:
             for block in blocks_per_group:
                 # ref_cnt=0 means this block is in the free list (i.e. eviction
                 # candidate), so remove it.
                 if block.ref_cnt == 0 and not block.is_null:
-                    self.free_block_queue.remove(block)
+                    if block.is_hot:
+                        self.hot_free_queue.remove(block)
+                    else:
+                        self.cold_free_queue.remove(block)
+                
                 block.ref_cnt += 1
                 
-                # 对于 probe_req 的命中，不设置 is_hot
+                # For probe_req hits, we might not want to set is_hot
                 if not no_set_hot:
                     block.is_hot = True
 
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
-        """hot blocks 放到 free queue 的后面, cold blocks 放到前面。
-        这样可以优先分配 cold blocks, 减少 hot blocks 被 evict 的概率
+        """
+        Free blocks and put them back into respective LRU queues based on is_hot.
         """
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
         hot_blocks = []
         cold_blocks = []
+        
         for block in blocks_list:
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
@@ -481,5 +499,9 @@ class ColdHotBlockPool(BlockPool):
                 else:
                     cold_blocks.append(block)
         
-        self.free_block_queue.append_n(hot_blocks)
-        self.free_block_queue.prepend_n(cold_blocks)
+        # Append to the end of the queues (MRU side)
+        self.hot_free_queue.append_n(hot_blocks)
+        self.cold_free_queue.append_n(cold_blocks)
+
+    def get_num_free_blocks(self) -> int:
+        return self.cold_free_queue.num_free_blocks + self.hot_free_queue.num_free_blocks

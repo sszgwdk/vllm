@@ -123,6 +123,7 @@ def sample_requests_from_dataset(
     tokenizer: PreTrainedTokenizerBase,
     input_length_range: tuple[int, int],
     fixed_output_len: Optional[int],
+    seed: Optional[int] = None,
 ) -> list[Request]:
     # if fixed_output_len is not None and fixed_output_len < 4:
     #     raise ValueError("output_len too small")
@@ -139,7 +140,10 @@ def sample_requests_from_dataset(
     ]
 
     # Shuffle the dataset.
-    random.shuffle(dataset)
+    if seed is not None:
+        random.Random(seed).shuffle(dataset)
+    else:
+        random.shuffle(dataset)
 
     min_len, max_len = input_length_range
     assert min_len >= 0 and max_len >= min_len, "input_length_range too small"
@@ -192,13 +196,16 @@ def sample_requests_from_random(
 
 
 def repeat_and_sort_requests(
-    requests: list[Request], repeat_count: int, sort: bool = False
+    requests: list[Request], repeat_count: int, sort: bool = False, seed: Optional[int] = None
 ) -> list[str]:
     repeated_requests = requests * repeat_count
     if sort:
         repeated_requests.sort(key=lambda x: x[1])
     else:
-        random.shuffle(repeated_requests)
+        if seed is not None:
+            random.Random(seed).shuffle(repeated_requests)
+        else:
+            random.shuffle(repeated_requests)
     return [req.prompt for req in repeated_requests]
 
 
@@ -218,6 +225,7 @@ def main(args):
             tokenizer=tokenizer,
             input_length_range=input_length_range,
             fixed_output_len=args.output_len,
+            seed=args.shuffle_seed,
         )
     else:
         print(f"Start to sample {args.num_prompts} prompts from random")
@@ -249,7 +257,10 @@ def main(args):
 
     print("Testing filtered requests")
     prompts = repeat_and_sort_requests(
-        filtered_requests, repeat_count=args.repeat_count, sort=args.sort
+        filtered_requests,
+        repeat_count=args.repeat_count,
+        sort=args.sort,
+        seed=args.shuffle_seed,
     )
 
     print("------start generating------")
@@ -307,6 +318,12 @@ def create_argument_parser():
             "Do not detokenize responses (i.e. do not include "
             "detokenization time in the latency measurement)"
         ),
+    )
+    parser.add_argument(
+        "--shuffle-seed",
+        type=int,
+        default=1,
+        help="Seed for shuffling the dataset",
     )
 
     parser = EngineArgs.add_cli_args(parser)

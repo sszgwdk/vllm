@@ -419,6 +419,7 @@ class EngineArgs:
         bool] = SchedulerConfig.enable_chunked_prefill
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
     enable_gate_optimization: bool = SchedulerConfig.enable_gate_optimization
+    prefix_threshold_for_use_probe_req: int = SchedulerConfig.prefix_threshold_for_use_probe_req
     debug_gate_mechanism: bool = SchedulerConfig.debug_gate_mechanism
 
     disable_hybrid_kv_cache_manager: bool = (
@@ -921,6 +922,9 @@ class EngineArgs:
                                      **scheduler_kwargs["enable_gate_optimization"])
         scheduler_group.add_argument("--debug-gate-mechanism",
                                      **scheduler_kwargs["debug_gate_mechanism"])
+        scheduler_group.add_argument(
+            "--prefix-threshold-for-use-gate",
+            **scheduler_kwargs["prefix_threshold_for_use_probe_req"])
 
         # vLLM arguments
         vllm_kwargs = get_kwargs(VllmConfig)
@@ -1386,6 +1390,7 @@ class EngineArgs:
             async_scheduling=self.async_scheduling,
             enable_gate_optimization=self.enable_gate_optimization,
             debug_gate_mechanism=self.debug_gate_mechanism,
+            prefix_threshold_for_use_probe_req=self.prefix_threshold_for_use_probe_req,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

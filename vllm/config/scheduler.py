@@ -88,8 +88,10 @@ class SchedulerConfig:
     enable_gate_optimization: bool = False
     """If True, enables the Gate Mechanism optimization using probe requests."""
 
+    prefix_threshold_for_use_probe_req: int = 512
+    """当已匹配的前缀长度超过该阈值时, 默认为热前缀, 不需要再使用gate机制."""
+
     debug_gate_mechanism: bool = False
-    """If True, enables additional logging for the Gate Mechanism optimization."""
 
     gate_probe_ids: Any = None
     """Dictionary containing token IDs for the gate mechanism probe."""

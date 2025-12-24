@@ -278,7 +278,7 @@ class KVCacheManager:
 
         # Touch the computed blocks to make sure they won't be evicted.
         if self.enable_caching:
-            # 对于 probe_req 的命中，不设置 is_hot
+            # 对于 probe_req 的命中，不设置为 hot
             if self.kv_cache_config.enable_gate_optimization and no_set_hot:
                 self.block_pool.touch(new_computed_block_list, no_set_hot=True)
 
