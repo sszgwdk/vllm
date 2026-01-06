@@ -93,6 +93,9 @@ class SchedulerConfig:
 
     debug_gate_mechanism: bool = False
 
+    enable_cold_hot_lru_cache: bool = False
+    """区分冷热 block, 使用两个 lru, 优先保热 block 不被淘汰."""
+
     gate_probe_ids: Any = None
     """Dictionary containing token IDs for the gate mechanism probe."""
 

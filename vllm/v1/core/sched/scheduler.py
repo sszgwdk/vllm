@@ -171,18 +171,15 @@ class Scheduler(SchedulerInterface):
         self.probe_suffix_ids = []
         self.yes_id = 0
         self.no_id = 0
+        logger.info("Gate optimization enabled: %s", self.scheduler_config.enable_gate_optimization)
         if self.scheduler_config.enable_gate_optimization:
             if self.scheduler_config.gate_probe_ids:
                 self.probe_suffix_ids = self.scheduler_config.gate_probe_ids["probe_suffix_ids"]
                 self.yes_id = self.scheduler_config.gate_probe_ids["yes_id"]
                 self.no_id = self.scheduler_config.gate_probe_ids["no_id"]
-                
-                # notice: enable gate optimization in kv_cache_config
-                self.kv_cache_config.enable_gate_optimization = True
-                self.kv_cache_config.debug_gate_mechanism = \
-                    self.scheduler_config.debug_gate_mechanism
             else:
                 logger.warning("Gate optimization enabled but no probe IDs provided.")
+        self.kv_cache_config.enable_cold_hot_lru_cache = self.scheduler_config.enable_cold_hot_lru_cache
 
         self.probe_map = {} # probe_id -> raw_id
         self.request_block_hasher: Optional[Callable[[Request],list[BlockHash]]] = None
@@ -420,6 +417,10 @@ class Scheduler(SchedulerInterface):
                             skipped_waiting_requests.prepend_request(request)
                             continue
 
+                        if num_external_computed_tokens:
+                            self.kv_cache_manager.record_external_cache_hits(
+                                request, num_external_computed_tokens)
+
                     # Total computed tokens (local + external).
                     num_computed_tokens = (num_new_local_computed_tokens +
                                            num_external_computed_tokens)
@@ -540,7 +541,7 @@ class Scheduler(SchedulerInterface):
                     # 指导后续 lmcache 的卸载策略
                     if (self.scheduler_config.enable_gate_optimization and 
                         num_computed_tokens < self.scheduler_config.prefix_threshold_for_use_probe_req and
-                        not request.is_probe and 
+                        not request.is_probe and
                         request.request_id not in self.probe_map.values() and
                         request.probe_req_id is None):
                         
@@ -684,7 +685,7 @@ class Scheduler(SchedulerInterface):
             get_freed_mm_hashes(),
             structured_output_request_ids=structured_output_request_ids,
             grammar_bitmask=grammar_bitmask,
-            probe_map=self.probe_map,
+            probe_map=self.probe_map if self.scheduler_config.enable_gate_optimization else None,
             gate_params=(self.yes_id, self.no_id) if self.scheduler_config.enable_gate_optimization else None,
         )
 

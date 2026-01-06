@@ -189,8 +189,19 @@ class KVCacheManager:
             self.prefix_cache_stats.requests += 1
             self.prefix_cache_stats.queries += request.num_tokens
             self.prefix_cache_stats.hits += num_new_computed_tokens
+            self.prefix_cache_stats.gpu_hits += num_new_computed_tokens
 
         return KVCacheBlocks(computed_blocks), num_new_computed_tokens
+
+    def record_external_cache_hits(self, request: Request,
+                                   num_hits: int) -> None:
+        """Record cache hits served by external KV connectors."""
+        if not self.log_stats or num_hits <= 0 or request.is_probe:
+            return
+
+        assert self.prefix_cache_stats is not None
+        self.prefix_cache_stats.hits += num_hits
+        self.prefix_cache_stats.external_hits += num_hits
 
     def allocate_slots(
         self,
@@ -279,7 +290,7 @@ class KVCacheManager:
         # Touch the computed blocks to make sure they won't be evicted.
         if self.enable_caching:
             # 对于 probe_req 的命中，不设置为 hot
-            if self.kv_cache_config.enable_gate_optimization and no_set_hot:
+            if self.kv_cache_config.enable_cold_hot_lru_cache and no_set_hot:
                 self.block_pool.touch(new_computed_block_list, no_set_hot=True)
 
             else:
@@ -300,7 +311,7 @@ class KVCacheManager:
         # num_tokens_need_slot = num_computed_tokens + external_tokens + num_new_tokens
         # 此时 new_blocks 包含了 external tokens 和 new_tokens 对应的 blocks
         # 需要计算出 external tokens 对应的 blocks 数量，将其标记为 is_hot = True
-        if self.kv_cache_config.enable_gate_optimization and \
+        if self.kv_cache_config.enable_cold_hot_lru_cache and \
             self.block_size is not None and self.block_size > 0 and num_external_tokens > 0:
             # 理论上 num_external_tokens 一定是 block_size 的整数倍
             num_external_blocks = cdiv(num_external_tokens, self.block_size)

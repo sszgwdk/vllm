@@ -30,6 +30,7 @@ ShareGPT example usage:
 
 import dataclasses
 import json
+import math
 import random
 import time
 from typing import Optional
@@ -63,6 +64,18 @@ def get_detailed_metrics(llm):
                         metrics['prefix_cache_hit_rate'] = logger.prefix_caching_metrics.hit_rate
                         if hasattr(logger.prefix_caching_metrics, 'total_hit_rate'):
                             metrics['prefix_cache_total_hit_rate'] = logger.prefix_caching_metrics.total_hit_rate
+
+                        # Detailed hit rates by source (GPU vs connector)
+                        for attr in [
+                            ('gpu_prefix_cache_hit_rate', 'gpu_hit_rate'),
+                            ('connector_prefix_cache_hit_rate', 'connector_hit_rate'),
+                            ('gpu_prefix_cache_total_hit_rate', 'total_gpu_hit_rate'),
+                            ('connector_prefix_cache_total_hit_rate',
+                             'total_connector_hit_rate'),
+                        ]:
+                            key, prop = attr
+                            if hasattr(logger.prefix_caching_metrics, prop):
+                                metrics[key] = getattr(logger.prefix_caching_metrics, prop)
                         
                         if hasattr(logger, 'cumulative_prompt_tokens'):
                             metrics['total_prompt_tokens'] = logger.cumulative_prompt_tokens
@@ -86,10 +99,12 @@ def test_prefix(llm=None, sampling_params=None, prompts=None):
     
     metrics = get_detailed_metrics(llm)
     if metrics:
-        if 'prefix_cache_hit_rate' in metrics:
-            print(f"Prefix cache hit rate (recent): {metrics['prefix_cache_hit_rate'] * 100:.2f}%")
         if 'prefix_cache_total_hit_rate' in metrics:
             print(f"Prefix cache hit rate (total): {metrics['prefix_cache_total_hit_rate'] * 100:.2f}%")
+            if 'gpu_prefix_cache_total_hit_rate' in metrics:
+                print(f"  GPU hit rate (total): {metrics['gpu_prefix_cache_total_hit_rate'] * 100:.2f}%")
+            if 'connector_prefix_cache_total_hit_rate' in metrics:
+                print(f"  Connector hit rate (total): {metrics['connector_prefix_cache_total_hit_rate'] * 100:.2f}%")
         
         if 'total_prompt_tokens' in metrics and 'total_generation_tokens' in metrics:
             total_tokens = metrics['total_prompt_tokens'] + metrics['total_generation_tokens']
@@ -200,13 +215,62 @@ def repeat_and_sort_requests(
 ) -> list[str]:
     repeated_requests = requests * repeat_count
     if sort:
-        repeated_requests.sort(key=lambda x: x[1])
+        repeated_requests.sort(key=lambda r: r.prompt_len)
     else:
         if seed is not None:
             random.Random(seed).shuffle(repeated_requests)
         else:
             random.shuffle(repeated_requests)
     return [req.prompt for req in repeated_requests]
+
+
+def zipf_repeat_requests(
+    requests: list[Request],
+    total_count: int,
+    exponent: float = 0.8,
+    sort: bool = False,
+    seed: Optional[int] = None,
+) -> list[str]:
+    """Repeat requests according to a Zipf distribution over ranks.
+
+    Guarantees each request appears at least once.
+
+    Args:
+        requests: Base unique requests.
+        total_count: Total number of requests to generate.
+        exponent: Zipf exponent s.
+        sort: If True, sort by prompt length (frequency unchanged).
+        seed: RNG seed for reproducibility.
+    """
+    if not requests:
+        return []
+
+    rng = random.Random(seed)
+
+    # Randomly assign popularity ranks under the given seed.
+    ranked_requests: list[Request] = list(requests)
+    rng.shuffle(ranked_requests)
+    n = len(ranked_requests)
+
+    # Ensure each prompt appears at least once.
+    total_count = max(total_count, n)
+
+    # Assign popularity by rank (1..n). rank=1 is the most popular.
+    weights = [1.0 / math.pow(rank, exponent) for rank in range(1, n + 1)]
+    remaining = total_count - n
+
+    # Ensure each prompt appears at least once.
+    repeated: list[Request] = list(ranked_requests)
+    if remaining > 0:
+        # Sample additional requests with replacement according to Zipf weights.
+        sampled_indices = rng.choices(range(n), weights=weights, k=remaining)
+        repeated.extend(ranked_requests[i] for i in sampled_indices)
+
+    if sort:
+        repeated.sort(key=lambda r: r.prompt_len)
+    else:
+        rng.shuffle(repeated)
+    return [r.prompt for r in repeated]
 
 
 def main(args):
@@ -256,12 +320,33 @@ def main(args):
     )
 
     print("Testing filtered requests")
-    prompts = repeat_and_sort_requests(
-        filtered_requests,
-        repeat_count=args.repeat_count,
-        sort=args.sort,
-        seed=args.shuffle_seed,
-    )
+    if args.use_zipf:
+        if args.zipf_scale < 1:
+            raise ValueError("--zipf-scale must be >= 1")
+
+        # In Zipf mode, the total request volume is controlled by zipf_scale.
+        # Note: --repeat-count is ignored in this mode.
+        total_count = len(filtered_requests) * args.zipf_scale
+        prompts = zipf_repeat_requests(
+            filtered_requests,
+            total_count=total_count,
+            exponent=0.8,
+            sort=args.sort,
+            seed=args.shuffle_seed,
+        )
+        print(
+            "Using Zipf(s=0.8) frequency over prompts; "
+            "each prompt appears at least once. "
+            "Note: --repeat-count is ignored in this mode; use --zipf-scale instead."
+        )
+        print(f"Total requests: {len(prompts)} (unique: {len(filtered_requests)})")
+    else:
+        prompts = repeat_and_sort_requests(
+            filtered_requests,
+            repeat_count=args.repeat_count,
+            sort=args.sort,
+            seed=args.shuffle_seed,
+        )
 
     print("------start generating------")
     test_prefix(
@@ -290,7 +375,26 @@ def create_argument_parser():
         "--repeat-count",
         type=int,
         default=1,
-        help="Number of times to repeat each prompt",
+        help="Number of times to repeat each prompt (ignored when --use-zipf is set)",
+    )
+    parser.add_argument(
+        "--use-zipf",
+        action="store_true",
+        help=(
+            "Use Zipf(s=0.8) frequency distribution over sampled prompts "
+            "to simulate a skewed query workload. Each prompt appears at least once. "
+            "In this mode, --repeat-count is ignored; "
+            "use --zipf-scale to control total request count (num_prompts * zipf_scale)."
+        ),
+    )
+    parser.add_argument(
+        "--zipf-scale",
+        type=int,
+        default=3,
+        help=(
+            "Zipf mode only: total request multiplier. "
+            "Total requests = num_prompts * zipf_scale (must be >= 1)."
+        ),
     )
     parser.add_argument(
         "--sort", action="store_true", help="Sort prompts by input length"

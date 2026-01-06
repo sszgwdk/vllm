@@ -30,7 +30,7 @@ class KVCacheCoordinator(ABC):
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
 
-        if kv_cache_config.enable_gate_optimization:
+        if kv_cache_config.enable_cold_hot_lru_cache:
             self.block_pool = ColdHotBlockPool(kv_cache_config.num_blocks, enable_caching,
                                     enable_kv_cache_events)
         else:

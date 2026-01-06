@@ -138,7 +138,7 @@ class LoggingStatLogger(StatLoggerBase):
             "Avg generation throughput: %.1f tokens/s, "
             "Running: %d reqs, Waiting: %d reqs, "
             "GPU KV cache usage: %.1f%%, "
-            "Prefix cache hit rate: %.1f%%",
+            "Prefix cache hit rate: %.1f%% (GPU %.1f%%, Connector %.1f%%)",
             self.engine_index,
             prompt_throughput,
             generation_throughput,
@@ -146,6 +146,8 @@ class LoggingStatLogger(StatLoggerBase):
             scheduler_stats.num_waiting_reqs,
             scheduler_stats.kv_cache_usage * 100,
             self.prefix_caching_metrics.hit_rate * 100,
+            self.prefix_caching_metrics.gpu_hit_rate * 100,
+            self.prefix_caching_metrics.connector_hit_rate * 100,
         )
         self.spec_decoding_logging.log(log_fn=log_fn)
         self.kv_transfer_logging.log(log_fn=log_fn)
@@ -551,7 +553,7 @@ class PrometheusStatLogger(StatLoggerBase):
                 self.counter_gpu_prefix_cache_queries[engine_idx].inc(
                     scheduler_stats.prefix_cache_stats.queries)
                 self.counter_gpu_prefix_cache_hits[engine_idx].inc(
-                    scheduler_stats.prefix_cache_stats.hits)
+                    scheduler_stats.prefix_cache_stats.gpu_hits)
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries)

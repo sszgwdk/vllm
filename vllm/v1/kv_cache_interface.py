@@ -374,5 +374,5 @@ class KVCacheConfig:
     """
     kv_cache_groups: list[KVCacheGroupSpec]
 
-    enable_gate_optimization: bool = False
-    debug_gate_mechanism: bool = False
+    enable_cold_hot_lru_cache: bool = False
+    """区分冷热 block, 使用两个 lru, 优先保热 block 不被淘汰."""

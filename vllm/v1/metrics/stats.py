@@ -24,6 +24,10 @@ class PrefixCacheStats:
     queries: int = 0
     # The number of hits in these requests.
     hits: int = 0
+    # The number of hits served from local GPU cache.
+    gpu_hits: int = 0
+    # The number of hits served via KV connector.
+    external_hits: int = 0
 
 
 @dataclass

@@ -109,12 +109,16 @@ class PrefixCachingMetrics:
         self.aggregated_requests = 0
         self.aggregated_query_total = 0
         self.aggregated_query_hit = 0
+        self.aggregated_query_hit_gpu = 0
+        self.aggregated_query_hit_external = 0
         # A deque of (requests, queries, hits) for the most recent requests.
-        self.query_queue: deque[tuple[int, int, int]] = deque()
+        self.query_queue: deque[tuple[int, int, int, int, int]] = deque()
 
         # Cumulative stats
         self.total_queries = 0
         self.total_hits = 0
+        self.total_gpu_hits = 0
+        self.total_external_hits = 0
 
     def observe(self, stats: PrefixCacheStats):
         """Observe the prefix caching for a set of requests.
@@ -139,14 +143,19 @@ class PrefixCachingMetrics:
             return
 
         # Update the metrics.
-        self.query_queue.append((stats.requests, stats.queries, stats.hits))
+        self.query_queue.append((stats.requests, stats.queries, stats.hits,
+                     stats.gpu_hits, stats.external_hits))
         self.aggregated_requests += stats.requests
         self.aggregated_query_total += stats.queries
         self.aggregated_query_hit += stats.hits
+        self.aggregated_query_hit_gpu += stats.gpu_hits
+        self.aggregated_query_hit_external += stats.external_hits
         
         # Update cumulative stats
         self.total_queries += stats.queries
         self.total_hits += stats.hits
+        self.total_gpu_hits += stats.gpu_hits
+        self.total_external_hits += stats.external_hits
 
         # Remove the oldest stats until number of requests does not exceed
         # the limit.
@@ -154,20 +163,27 @@ class PrefixCachingMetrics:
         while len(
                 self.query_queue
         ) > 1 and self.aggregated_requests > self.max_recent_requests:
-            old_requests, old_queries, old_hits = self.query_queue.popleft()
+            (old_requests, old_queries, old_hits, old_gpu_hits,
+             old_external_hits) = self.query_queue.popleft()
             self.aggregated_requests -= old_requests
             self.aggregated_query_total -= old_queries
             self.aggregated_query_hit -= old_hits
+            self.aggregated_query_hit_gpu -= old_gpu_hits
+            self.aggregated_query_hit_external -= old_external_hits
 
     def reset(self):
         """Reset the metrics."""
         self.aggregated_requests = 0
         self.aggregated_query_total = 0
         self.aggregated_query_hit = 0
+        self.aggregated_query_hit_gpu = 0
+        self.aggregated_query_hit_external = 0
         self.query_queue.clear()
 
         self.total_queries = 0
         self.total_hits = 0
+        self.total_gpu_hits = 0
+        self.total_external_hits = 0
 
     @property
     def hit_rate(self) -> float:
@@ -175,6 +191,19 @@ class PrefixCachingMetrics:
         if self.aggregated_query_total == 0:
             return 0.0
         return self.aggregated_query_hit / self.aggregated_query_total
+
+    @property
+    def gpu_hit_rate(self) -> float:
+        if self.aggregated_query_total == 0:
+            return 0.0
+        return self.aggregated_query_hit_gpu / self.aggregated_query_total
+
+    @property
+    def connector_hit_rate(self) -> float:
+        if self.aggregated_query_total == 0:
+            return 0.0
+        return (self.aggregated_query_hit_external /
+                self.aggregated_query_total)
         
     @property
     def total_hit_rate(self) -> float:
@@ -182,6 +211,18 @@ class PrefixCachingMetrics:
         if self.total_queries == 0:
             return 0.0
         return self.total_hits / self.total_queries
+
+    @property
+    def total_gpu_hit_rate(self) -> float:
+        if self.total_queries == 0:
+            return 0.0
+        return self.total_gpu_hits / self.total_queries
+
+    @property
+    def total_connector_hit_rate(self) -> float:
+        if self.total_queries == 0:
+            return 0.0
+        return self.total_external_hits / self.total_queries
 
 
 @dataclass
