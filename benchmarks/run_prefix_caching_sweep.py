@@ -5,8 +5,9 @@
 """Sequentially run benchmark_prefix_caching with different cache configs.
 
 This script runs benchmark_prefix_caching.py for multiple combinations of
-layer-wise cache and cold-hot LRU cache settings, captures the stdout for each
-run, parses key metrics, and prints a compact summary.
+layer-wise cache, cold-hot LRU cache, and optional LMCACHE_CACHE_POLICY
+settings, captures the stdout for each run, parses key metrics, and prints a
+compact summary.
 """
 
 from __future__ import annotations
@@ -14,8 +15,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import errno
+import pty
 import re
 import shlex
+import select
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -30,6 +34,7 @@ DEFAULT_KV_TRANSFER_CONFIG = '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv
 class RunConfig:
     layerwise: int
     cold_hot_lru: bool
+    cache_policy_enabled: bool
 
 
 @dataclass
@@ -61,6 +66,19 @@ def parse_lru_options(raw: str) -> List[bool]:
             continue
         if key not in mapping:
             raise argparse.ArgumentTypeError("cold-hot-lru options must be on/off or 1/0")
+        values.append(mapping[key])
+    return values or [True, False]
+
+
+def parse_cache_policy_options(raw: str) -> List[bool]:
+    mapping = {"on": True, "off": False, "1": True, "0": False, "true": True, "false": False}
+    values: List[bool] = []
+    for item in raw.split(","):
+        key = item.strip().lower()
+        if not key:
+            continue
+        if key not in mapping:
+            raise argparse.ArgumentTypeError("cache-policy options must be on/off or 1/0")
         values.append(mapping[key])
     return values or [True, False]
 
@@ -107,25 +125,79 @@ def build_base_command(args: argparse.Namespace, bench_script: Path) -> List[str
     return cmd
 
 
-def run_once(base_cmd: List[str], config: RunConfig, env_base: Dict[str, str], repo_root: Path) -> RunResult:
+def run_once(
+    base_cmd: List[str],
+    config: RunConfig,
+    env_base: Dict[str, str],
+    repo_root: Path,
+    show_progress: bool,
+) -> RunResult:
     cmd = list(base_cmd)
     if config.cold_hot_lru:
         cmd.append("--enable-cold-hot-lru-cache")
 
     env = env_base.copy()
     env["LMCACHE_USE_LAYERWISE"] = str(config.layerwise)
+    if config.cache_policy_enabled:
+        env["LMCACHE_CACHE_POLICY"] = env_base.get("LMCACHE_CACHE_POLICY", "FIFO_REINSERTION")
+    else:
+        env.pop("LMCACHE_CACHE_POLICY", None)
 
-    proc = subprocess.run(
-        cmd,
-        cwd=repo_root,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    if show_progress:
+        # Use a PTY so tqdm-like progress bars are not disabled (isatty stays True).
+        master_fd, slave_fd = pty.openpty()
+        output_chunks: List[bytes] = []
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=repo_root,
+                env=env,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                text=False,
+                close_fds=True,
+            )
+            os.close(slave_fd)
 
-    metrics = parse_metrics(proc.stdout)
-    return RunResult(config=config, exit_code=proc.returncode, metrics=metrics, stdout=proc.stdout)
+            while True:
+                rlist, _, _ = select.select([master_fd], [], [], 0.1)
+                if master_fd in rlist:
+                    try:
+                        data = os.read(master_fd, 4096)
+                    except OSError as exc:  # EOF on some platforms raises EIO
+                        if exc.errno == errno.EIO:
+                            break
+                        raise
+                    if not data:
+                        break
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.flush()
+                    output_chunks.append(data)
+                if proc.poll() is not None and not rlist:
+                    break
+            proc.wait()
+        finally:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+
+        stdout = b"".join(output_chunks).decode(errors="replace")
+        exit_code = proc.returncode
+    else:
+        proc = subprocess.run(
+            cmd,
+            cwd=repo_root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        stdout = proc.stdout
+        exit_code = proc.returncode
+
+    metrics = parse_metrics(stdout)
+    return RunResult(config=config, exit_code=exit_code, metrics=metrics, stdout=stdout)
 
 
 def parse_metrics(output: str) -> Dict[str, Any]:
@@ -153,6 +225,7 @@ def print_summary(results: List[RunResult]) -> None:
     headers = [
         "layerwise",
         "cold_hot_lru",
+        "cache_policy",
         "exit",
         "cost_s",
         "hit_total_%",
@@ -167,6 +240,7 @@ def print_summary(results: List[RunResult]) -> None:
         rows.append([
             str(r.config.layerwise),
             "on" if r.config.cold_hot_lru else "off",
+            "on" if r.config.cache_policy_enabled else "off",
             str(r.exit_code),
             fmt(m.get("cost_seconds")),
             fmt(m.get("prefix_cache_hit_rate_total")),
@@ -199,6 +273,7 @@ def build_env(args: argparse.Namespace) -> Dict[str, str]:
     env.setdefault("VLLM_USE_MODELSCOPE", "true")
     env.setdefault("LMCACHE_MAX_LOCAL_CPU_SIZE", str(args.max_local_cpu_size))
     env.setdefault("LMCACHE_LOG_LEVEL", args.lmcache_log_level)
+    env["LMCACHE_CACHE_POLICY"] = args.cache_policy_value
     if args.vllm_logging_level:
         env.setdefault("VLLM_LOGGING_LEVEL", args.vllm_logging_level)
     return env
@@ -226,6 +301,12 @@ def parse_args() -> argparse.Namespace:
                         help="Comma list of layerwise settings to sweep (0,1)")
     parser.add_argument("--cold-hot-lru-options", type=parse_lru_options, default="on,off",
                         help="Comma list of cold-hot-lru settings to sweep (on,off)")
+    parser.add_argument("--cache-policy-options", type=parse_cache_policy_options, default="on,off",
+                        help="Comma list to toggle LMCACHE_CACHE_POLICY per run (on,off)")
+    parser.add_argument("--cache-policy-value", default="FIFO_REINSERTION",
+                        help="Value assigned to LMCACHE_CACHE_POLICY when enabled")
+    parser.add_argument("--show-progress", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use a PTY to preserve tqdm-style progress bars during sweeps (default: on)")
     parser.add_argument("--extra-args", default="", help="Extra args appended to benchmark command")
     parser.add_argument("--max-local-cpu-size", type=float, default=150.0)
     parser.add_argument("--lmcache-log-level", default="WARNING")
@@ -246,21 +327,33 @@ def main() -> None:
     base_cmd = build_base_command(args, bench_script)
 
     sweep: List[RunConfig] = [
-        RunConfig(layerwise=l, cold_hot_lru=c)
+        RunConfig(layerwise=l, cold_hot_lru=c, cache_policy_enabled=p)
         for l in args.layerwise_options
         for c in args.cold_hot_lru_options
+        for p in args.cache_policy_options
     ]
 
     print("Base command:")
     print(" ".join(shlex.quote(part) for part in base_cmd))
     print("Env overrides (per-run LMCACHE_USE_LAYERWISE is set by sweep):")
-    for key in ["VLLM_USE_MODELSCOPE", "LMCACHE_MAX_LOCAL_CPU_SIZE", "LMCACHE_LOG_LEVEL", "VLLM_LOGGING_LEVEL"]:
+    env_keys = [
+        "VLLM_USE_MODELSCOPE",
+        "LMCACHE_MAX_LOCAL_CPU_SIZE",
+        "LMCACHE_LOG_LEVEL",
+        "VLLM_LOGGING_LEVEL",
+        "LMCACHE_CACHE_POLICY",
+    ]
+    for key in env_keys:
         if key in env_base:
             print(f"  {key}={env_base[key]}")
 
     results: List[RunResult] = []
     for idx, config in enumerate(sweep, start=1):
-        print(f"\n=== Run {idx}/{len(sweep)} | layerwise={config.layerwise} | cold_hot_lru={'on' if config.cold_hot_lru else 'off'} ===")
+        print(
+            f"\n=== Run {idx}/{len(sweep)} | layerwise={config.layerwise} | "
+            f"cold_hot_lru={'on' if config.cold_hot_lru else 'off'} | "
+            f"cache_policy={'on' if config.cache_policy_enabled else 'off'} ==="
+        )
         cmd_with_flags = list(base_cmd)
         if config.cold_hot_lru:
             cmd_with_flags.append("--enable-cold-hot-lru-cache")
@@ -268,7 +361,7 @@ def main() -> None:
         print(" ".join(shlex.quote(part) for part in cmd_with_flags))
         if args.dry_run:
             continue
-        result = run_once(base_cmd, config, env_base, repo_root)
+        result = run_once(base_cmd, config, env_base, repo_root, args.show_progress)
         results.append(result)
         print("Exit code:", result.exit_code)
         print("Captured metrics:", json.dumps(result.metrics, indent=2))
@@ -287,6 +380,7 @@ def main() -> None:
             {
                 "layerwise": r.config.layerwise,
                 "cold_hot_lru": r.config.cold_hot_lru,
+                "cache_policy_enabled": r.config.cache_policy_enabled,
                 "exit_code": r.exit_code,
                 "metrics": r.metrics,
                 "stdout": r.stdout,

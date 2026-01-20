@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TYPE_CHECKING, Any, Optional
+from dataclasses import dataclass
+import copy
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
@@ -8,6 +10,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -18,6 +21,63 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class LMCacheKVConnectorStats(KVConnectorStats):
+    """Container for LMCache load metrics."""
+
+    def __post_init__(self):
+        if "lmcache_load_count" not in self.data:
+            self.data["lmcache_load_count"] = 0
+        if "lmcache_load_total_time_s" not in self.data:
+            self.data["lmcache_load_total_time_s"] = 0.0
+        if "lmcache_load_total_bytes" not in self.data:
+            self.data["lmcache_load_total_bytes"] = 0
+
+    def reset(self):
+        self.data = {
+            "lmcache_load_count": 0,
+            "lmcache_load_total_time_s": 0.0,
+            "lmcache_load_total_bytes": 0,
+        }
+
+    def clone_and_reset(self) -> "LMCacheKVConnectorStats":
+        old = copy.copy(self)
+        self.reset()
+        return old
+
+    def is_empty(self) -> bool:
+        return self.data.get("lmcache_load_count", 0) == 0
+
+    def aggregate(self, other: "KVConnectorStats") -> "KVConnectorStats":
+        if not other.is_empty():
+            self.data["lmcache_load_count"] += other.data.get(
+                "lmcache_load_count", 0)
+            self.data["lmcache_load_total_time_s"] += other.data.get(
+                "lmcache_load_total_time_s", 0.0)
+            self.data["lmcache_load_total_bytes"] += other.data.get(
+                "lmcache_load_total_bytes", 0)
+        return self
+
+    def reduce(self) -> dict[str, Union[int, float]]:
+        count = self.data.get("lmcache_load_count", 0)
+        total_time_s = self.data.get("lmcache_load_total_time_s", 0.0)
+        total_bytes = self.data.get("lmcache_load_total_bytes", 0)
+
+        mean_time_ms = (total_time_s / count * 1000.0) if count > 0 else 0.0
+        agg_bw_gbps = (
+            (total_bytes / total_time_s) / (1024**3)
+            if total_time_s > 0 else 0.0
+        )
+
+        return {
+            "lmcache_load_count": count,
+            "lmcache_load_total_time_s": total_time_s,
+            "lmcache_load_total_bytes": total_bytes,
+            "lmcache_load_mean_time_ms": mean_time_ms,
+            "lmcache_load_agg_bw_gbps": agg_bw_gbps,
+        }
 
 
 class LMCacheConnectorV1(KVConnectorBase_V1):
@@ -103,6 +163,19 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             call to this method (this call or a prior one).
         """
         return self._lmcache_engine.get_finished(finished_req_ids)
+
+    def get_kv_connector_stats(self) -> Optional[KVConnectorStats]:
+        stats = self._lmcache_engine.get_kv_connector_stats()
+        if stats is None:
+            return LMCacheKVConnectorStats()
+        return LMCacheKVConnectorStats(data=stats)
+
+    @classmethod
+    def build_kv_connector_stats(
+            cls,
+            data: Optional[dict[str, Any]] = None) -> Optional[KVConnectorStats]:
+        return LMCacheKVConnectorStats(data=data) if data is not None \
+            else LMCacheKVConnectorStats()
 
     # ==============================
     # Scheduler-side methods
