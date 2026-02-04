@@ -355,9 +355,9 @@ class RunResult:
 
 def _run_and_collect(llm: LLM, prompts: list[str], sampling_params: SamplingParams) -> RunResult:
     _reset_kv_connector_metrics(llm)
-    start = time.time()
+    start = time.perf_counter()
     outputs = llm.generate(prompts, sampling_params=sampling_params)
-    wall = time.time() - start
+    wall = time.perf_counter() - start
     ttfts = _ttft_ms_from_outputs(outputs)
     kv_metrics = _get_kv_connector_metrics(llm)
     return RunResult(
