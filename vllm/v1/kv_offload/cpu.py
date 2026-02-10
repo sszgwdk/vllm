@@ -10,6 +10,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.v1.kv_offload.abstract import LoadStoreSpec, OffloadingManager
 from vllm.v1.kv_offload.backends.cpu import CPUBackend
+from vllm.v1.kv_offload.gflru_manager import GFLRUOffloadingManager
 from vllm.v1.kv_offload.lru_manager import LRUOffloadingManager
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec, GPULoadStoreSpec
 from vllm.v1.kv_offload.spec import OffloadingSpec
@@ -39,10 +40,16 @@ class CPUOffloadingSpec(OffloadingSpec):
             kv_events_config = self.vllm_config.kv_events_config
             enable_events = (kv_events_config is not None
                              and kv_events_config.enable_kv_cache_events)
-            self._manager = LRUOffloadingManager(CPUBackend(
-                block_size=self.offloaded_block_size,
-                num_blocks=self.num_cpu_blocks),
-                                                 enable_events=enable_events)
+            eviction_policy = str(
+                self.extra_config.get("eviction_policy", "lru")).lower()
+            backend = CPUBackend(block_size=self.offloaded_block_size,
+                                 num_blocks=self.num_cpu_blocks)
+            if eviction_policy == "gflru":
+                self._manager = GFLRUOffloadingManager(
+                    backend, enable_events=enable_events)
+            else:
+                self._manager = LRUOffloadingManager(
+                    backend, enable_events=enable_events)
         return self._manager
 
     def get_handlers(

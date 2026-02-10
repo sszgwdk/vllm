@@ -26,6 +26,7 @@ CacheDType = Literal["auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2",
                      "fp8_inc"]
 MambaDType = Literal["auto", "float32"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor"]
+PrefixCacheEvictionPolicy = Literal["lru", "gflru"]
 
 
 @config
@@ -69,6 +70,13 @@ class CacheConfig:
     `ModelConfig` and that value should be manually duplicated here."""
     enable_prefix_caching: Optional[bool] = None
     """Whether to enable prefix caching. Enabled by default for V1."""
+    prefix_cache_eviction_policy: PrefixCacheEvictionPolicy = "lru"
+    """Eviction/admission policy for the GPU prefix cache.
+
+    - "lru": Admit all full blocks and evict by LRU.
+    - "gflru": Admit blocks only if they are in the ghost cache or if the
+        ghost cache is empty. Rejected blocks are tracked in the ghost cache.
+    """
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:\n
     - "sha256" uses Pickle for object serialization before hashing.\n
@@ -200,6 +208,14 @@ class CacheConfig:
                 "Unknown prefix caching hash algorithm: "
                 f"{self.prefix_caching_hash_algo}. Must be one of "
                 f"{get_args(PrefixCachingHashAlgo)}.")
+
+        if (self.enable_prefix_caching
+                and self.prefix_cache_eviction_policy
+                not in get_args(PrefixCacheEvictionPolicy)):
+            raise ValueError(
+                "Unknown prefix cache eviction policy: "
+                f"{self.prefix_cache_eviction_policy}. Must be one of "
+                f"{get_args(PrefixCacheEvictionPolicy)}.")
 
     def verify_with_parallel_config(
         self,

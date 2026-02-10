@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections import OrderedDict
 from collections.abc import Iterable
 from typing import Any, Optional, Union
 
@@ -160,6 +161,8 @@ class BlockPool:
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
 
+        self.prefix_cache_eviction_policy = "lru"
+
     def get_cached_block(
             self, block_hash: BlockHash,
             kv_cache_group_ids: list[int]) -> Optional[list[KVCacheBlock]]:
@@ -193,7 +196,7 @@ class BlockPool:
         num_full_blocks: int,
         block_size: int,
         kv_cache_group_id: int,
-    ) -> None:
+    ) -> int:
         """Cache a list of full blocks for prefix caching.
         This function takes a list of blocks that will have their block hash
         metadata to be updated and cached. Given a request, it updates the
@@ -210,9 +213,12 @@ class BlockPool:
                 be cached after this function.
             block_size: Number of tokens in each block.
             kv_cache_group_id: The id of the KV cache group.
+
+        Returns:
+            The updated number of cached blocks for this request.
         """
         if num_cached_blocks == num_full_blocks:
-            return
+            return num_cached_blocks
         new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
         assert len(request.block_hashes) >= num_full_blocks
         new_block_hashes = request.block_hashes[num_cached_blocks:]
@@ -222,17 +228,16 @@ class BlockPool:
         for i, blk in enumerate(new_full_blocks):
             assert blk.block_hash is None
             block_hash = new_block_hashes[i]
-
-            # Update and added the full block to the cache.
             block_hash_with_group_id = make_block_hash_with_group_id(
                 block_hash, kv_cache_group_id)
+
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id,
                                                    blk)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
-        if self.enable_kv_cache_events:
+        if self.enable_kv_cache_events and new_hashes:
             if num_cached_blocks == 0:
                 parent_block_hash: Optional[ExternalBlockHash] = None
             else:
@@ -253,6 +258,8 @@ class BlockPool:
                     if request.lora_request else None,
                     medium=MEDIUM_GPU,
                 ))
+
+        return num_full_blocks
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
@@ -414,3 +421,144 @@ class BlockPool:
         events = self.kv_event_queue
         self.kv_event_queue = []
         return events
+
+
+class _GhostCache:
+    """FIFO ghost cache for recently evicted block hashes."""
+
+    def __init__(self, capacity: int):
+        self.capacity = max(1, capacity)
+        self._queue: OrderedDict[BlockHashWithGroupId, None] = OrderedDict()
+
+    def add(self, block_hash: BlockHashWithGroupId) -> None:
+        if block_hash in self._queue:
+            return
+        self._queue[block_hash] = None
+        while len(self._queue) > self.capacity:
+            self._queue.popitem(last=False)
+
+    def remove(self, block_hash: BlockHashWithGroupId) -> None:
+        self._queue.pop(block_hash, None)
+
+    def exists(self, block_hash: BlockHashWithGroupId) -> bool:
+        return block_hash in self._queue
+
+    def is_empty(self) -> bool:
+        return not self._queue
+
+
+class GFLruBlockPool(BlockPool):
+    """BlockPool with a ghost-first LRU admission policy."""
+
+    def __init__(
+        self,
+        num_gpu_blocks: int,
+        enable_caching: bool,
+        enable_kv_cache_events: bool = False,
+        ghost_capacity_multiplier: int = 4,
+    ):
+        super().__init__(
+            num_gpu_blocks=num_gpu_blocks,
+            enable_caching=enable_caching,
+            enable_kv_cache_events=enable_kv_cache_events,
+        )
+        self.prefix_cache_eviction_policy = "gflru"
+        ghost_capacity = max(1, num_gpu_blocks * ghost_capacity_multiplier)
+        self.ghost = _GhostCache(ghost_capacity)
+
+    def cache_full_blocks(
+        self,
+        request: Request,
+        blocks: list[KVCacheBlock],
+        num_cached_blocks: int,
+        num_full_blocks: int,
+        block_size: int,
+        kv_cache_group_id: int,
+    ) -> int:
+        if num_cached_blocks == num_full_blocks:
+            return num_cached_blocks
+        new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
+        assert len(request.block_hashes) >= num_full_blocks
+        new_block_hashes = request.block_hashes[num_cached_blocks:]
+
+        new_hashes: Optional[list[ExternalBlockHash]] = (
+            [] if self.enable_kv_cache_events else None)
+        num_admitted = 0
+        admission_blocked = False
+        for i, blk in enumerate(new_full_blocks):
+            assert blk.block_hash is None
+            block_hash = new_block_hashes[i]
+            block_hash_with_group_id = make_block_hash_with_group_id(
+                block_hash, kv_cache_group_id)
+
+            admit = True
+            if admission_blocked:
+                admit = False
+            elif self.ghost.exists(block_hash_with_group_id):
+                self.ghost.remove(block_hash_with_group_id)
+            elif self.ghost.is_empty():
+                admit = True
+            else:
+                admit = False
+                admission_blocked = True
+            if not admit:
+                self.ghost.add(block_hash_with_group_id)
+                continue
+
+            blk.block_hash = block_hash_with_group_id
+            self.cached_block_hash_to_block.insert(block_hash_with_group_id,
+                                                   blk)
+            num_admitted += 1
+            if new_hashes is not None:
+                new_hashes.append(maybe_convert_block_hash(block_hash))
+
+        if self.enable_kv_cache_events and new_hashes:
+            num_cached_after = num_cached_blocks + num_admitted
+            if num_cached_blocks == 0:
+                parent_block_hash: Optional[ExternalBlockHash] = None
+            else:
+                parent_block = blocks[num_cached_blocks - 1]
+                assert parent_block.block_hash is not None
+                parent_block_hash = maybe_convert_block_hash(
+                    get_block_hash(parent_block.block_hash))
+
+            self.kv_event_queue.append(
+                BlockStored(
+                    block_hashes=new_hashes,
+                    parent_block_hash=parent_block_hash,
+                    token_ids=request.
+                    all_token_ids[num_cached_blocks *
+                                  block_size:num_cached_after * block_size],
+                    block_size=block_size,
+                    lora_id=request.lora_request.id
+                    if request.lora_request else None,
+                    medium=MEDIUM_GPU,
+                ))
+
+        return num_cached_blocks + num_admitted
+
+    def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
+        block_hash = block.block_hash
+        if block_hash is None:
+            return False
+
+        if self.cached_block_hash_to_block.pop(block_hash,
+                                               block.block_id) is None:
+            return False
+
+        self.ghost.add(block_hash)
+        block.reset_hash()
+
+        if self.enable_kv_cache_events:
+            self.kv_event_queue.append(
+                BlockRemoved(block_hashes=[
+                    maybe_convert_block_hash(get_block_hash(block_hash))
+                ],
+                             medium=MEDIUM_GPU))
+        return True
+
+    def reset_prefix_cache(self) -> bool:
+        if not super().reset_prefix_cache():
+            return False
+        self.ghost = _GhostCache(self.ghost.capacity)
+        return True

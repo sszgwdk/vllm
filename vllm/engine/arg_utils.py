@@ -772,6 +772,9 @@ class EngineArgs:
                                  **cache_kwargs["num_gpu_blocks_override"])
         cache_group.add_argument("--enable-prefix-caching",
                                  **cache_kwargs["enable_prefix_caching"])
+        cache_group.add_argument("--prefix-cache-eviction-policy",
+                                 **cache_kwargs[
+                                     "prefix_cache_eviction_policy"])
         cache_group.add_argument("--prefix-caching-hash-algo",
                                  **cache_kwargs["prefix_caching_hash_algo"])
         cache_group.add_argument("--cpu-offload-gb",

@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.block_pool import BlockPool, GFLruBlockPool
 from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager, FullAttentionManager, get_manager_for_kv_cache_spec)
@@ -24,14 +24,19 @@ class KVCacheCoordinator(ABC):
         use_eagle: bool,
         enable_caching: bool,
         enable_kv_cache_events: bool,
+        prefix_cache_eviction_policy: str,
         dcp_world_size: int,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
 
-        self.block_pool = BlockPool(kv_cache_config.num_blocks, enable_caching,
-                                    enable_kv_cache_events)
+        use_gflru = (enable_caching
+                 and prefix_cache_eviction_policy.lower() == "gflru")
+        pool_cls = GFLruBlockPool if use_gflru else BlockPool
+        self.block_pool = pool_cls(kv_cache_config.num_blocks,
+                       enable_caching,
+                       enable_kv_cache_events)
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
         self.use_eagle = use_eagle
@@ -199,13 +204,14 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
     """
 
     def __init__(self, kv_cache_config: KVCacheConfig, max_model_len: int,
-                 use_eagle: bool, enable_kv_cache_events: bool,
-                 dcp_world_size: int):
+             use_eagle: bool, enable_kv_cache_events: bool,
+             prefix_cache_eviction_policy: str, dcp_world_size: int):
         super().__init__(kv_cache_config,
                          max_model_len,
                          use_eagle,
                          False,
                          enable_kv_cache_events,
+                 prefix_cache_eviction_policy,
                          dcp_world_size=dcp_world_size)
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -231,13 +237,15 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
     """
 
     def __init__(self, kv_cache_config: KVCacheConfig, max_model_len: int,
-                 use_eagle: bool, enable_caching: bool,
-                 enable_kv_cache_events: bool, dcp_world_size: int):
+             use_eagle: bool, enable_caching: bool,
+             enable_kv_cache_events: bool,
+             prefix_cache_eviction_policy: str, dcp_world_size: int):
         super().__init__(kv_cache_config,
                          max_model_len,
                          use_eagle,
                          enable_caching,
                          enable_kv_cache_events,
+                 prefix_cache_eviction_policy,
                          dcp_world_size=dcp_world_size)
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[
             0].kv_cache_spec
@@ -275,13 +283,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
     """
 
     def __init__(self, kv_cache_config: KVCacheConfig, max_model_len: int,
-                 use_eagle: bool, enable_caching: bool,
-                 enable_kv_cache_events: bool, dcp_world_size: int):
+             use_eagle: bool, enable_caching: bool,
+             enable_kv_cache_events: bool,
+             prefix_cache_eviction_policy: str, dcp_world_size: int):
         super().__init__(kv_cache_config,
                          max_model_len,
                          use_eagle,
                          enable_caching,
                          enable_kv_cache_events,
+                 prefix_cache_eviction_policy,
                          dcp_world_size=dcp_world_size)
         assert dcp_world_size == 1, "DCP not support hybrid attn now."
         self.verify_and_split_kv_cache_groups()
@@ -418,12 +428,14 @@ def get_kv_cache_coordinator(kv_cache_config: KVCacheConfig,
                              max_model_len: int, use_eagle: bool,
                              enable_caching: bool,
                              enable_kv_cache_events: bool,
+                             prefix_cache_eviction_policy: str,
                              dcp_world_size: int) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(kv_cache_config,
                                                max_model_len,
                                                use_eagle,
                                                enable_kv_cache_events,
+                                               prefix_cache_eviction_policy,
                                                dcp_world_size=dcp_world_size)
     if len(kv_cache_config.kv_cache_groups) == 1:
         return UnitaryKVCacheCoordinator(kv_cache_config,
@@ -431,10 +443,12 @@ def get_kv_cache_coordinator(kv_cache_config: KVCacheConfig,
                                          use_eagle,
                                          enable_caching,
                                          enable_kv_cache_events,
+                                         prefix_cache_eviction_policy,
                                          dcp_world_size=dcp_world_size)
     return HybridKVCacheCoordinator(kv_cache_config,
                                     max_model_len,
                                     use_eagle,
                                     enable_caching,
                                     enable_kv_cache_events,
+                                    prefix_cache_eviction_policy,
                                     dcp_world_size=dcp_world_size)

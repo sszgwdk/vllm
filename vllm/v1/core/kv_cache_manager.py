@@ -92,6 +92,7 @@ class KVCacheManager:
         use_eagle: bool = False,
         log_stats: bool = False,
         enable_kv_cache_events: bool = False,
+        prefix_cache_eviction_policy: str = "lru",
         dcp_world_size: int = 1,
     ) -> None:
         self.max_model_len = max_model_len
@@ -124,6 +125,7 @@ class KVCacheManager:
             use_eagle=self.use_eagle,
             enable_caching=self.enable_caching,
             enable_kv_cache_events=enable_kv_cache_events,
+            prefix_cache_eviction_policy=prefix_cache_eviction_policy,
             dcp_world_size=dcp_world_size,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)

@@ -172,6 +172,8 @@ class Scheduler(SchedulerInterface):
             use_eagle=self.use_eagle,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
+            prefix_cache_eviction_policy=
+            self.cache_config.prefix_cache_eviction_policy,
             dcp_world_size=self.dcp_world_size,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
