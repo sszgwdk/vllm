@@ -319,7 +319,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     repo_root = Path(__file__).resolve().parent.parent
-    bench_script = repo_root / "benchmarks" / "benchmark_prefix_caching.py"
+    bench_script = repo_root / "kai_benchmarks" / "benchmark_prefix_caching.py"
     if not bench_script.exists():
         raise FileNotFoundError(f"Missing benchmark script at {bench_script}")
 
