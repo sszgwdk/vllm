@@ -2448,6 +2448,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
                 # Post-process kv connector output.
                 kv_connector = get_kv_transfer_group()
+                logger.info(f"Doing wait_for_save")
+                logger.info(f"Compress = {req.save_spec.compress}")
                 kv_connector.wait_for_save()
                 kv_connector_output.finished_sending, kv_connector_output.finished_recving = (
                     kv_connector.get_finished(scheduler_output.finished_req_ids))

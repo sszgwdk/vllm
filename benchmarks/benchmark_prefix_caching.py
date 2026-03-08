@@ -91,11 +91,24 @@ def get_detailed_metrics(llm):
 def test_prefix(llm=None, sampling_params=None, prompts=None):
     start_time = time.time()
 
-    llm.generate(prompts, sampling_params=sampling_params)
+    # Generate with return_outputs=True to capture the outputs
+    outputs = llm.generate(prompts, sampling_params=sampling_params)
 
     end_time = time.time()
     duration = end_time - start_time
     print(f"cost time {duration:.2f}s")
+    
+    # Print the first few outputs to verify correctness
+    print("\n--- Sample Outputs (first 3) ---")
+    for i, output in enumerate(outputs[:3]):  # Print first 3 outputs
+        prompt = output.prompt
+        generated_text = output.outputs[0].text
+        print(f"Prompt {i+1}: {prompt[:100]}...")
+        print(f"Generated {i+1}: {generated_text}")
+        print("---")
+    
+    # Print total number of outputs generated
+    print(f"\nTotal prompts processed: {len(outputs)}")
     
     metrics = get_detailed_metrics(llm)
     if metrics:
